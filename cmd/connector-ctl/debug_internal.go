@@ -141,6 +141,17 @@ var debugExecInternal = &cobra.Command{
 		if err := unix.Mount("", "/", "", unix.MS_REC|unix.MS_PRIVATE, ""); err != nil {
 			return fmt.Errorf("make mount namespace private: %w", err)
 		}
+		// Remount sysfs so /sys/class/net reflects the debug netns: the
+		// inherited /sys mount stays tagged to the namespace it was mounted
+		// in (the initial one), exactly what `ip netns exec` corrects for.
+		// Best-effort: without it, netlink tools still work, but sysfs-based
+		// lookups inside the session would see the host's interfaces.
+		if err := unix.Unmount("/sys", unix.MNT_DETACH); err == nil {
+			if err := unix.Mount("sysfs", "/sys", "sysfs", 0, ""); err != nil {
+				fmt.Fprintf(os.Stderr, "debug-exec: sysfs remount failed (%v); /sys shows host devices\n", err)
+				_ = unix.Mount("none", "/sys", "", 0, "")
+			}
+		}
 		resolv := "/etc/netns/" + nsName + "/resolv.conf"
 		if _, err := os.Stat(resolv); err != nil {
 			return fmt.Errorf("debug resolv.conf: %w", err)
