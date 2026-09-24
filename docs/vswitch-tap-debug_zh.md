@@ -13,6 +13,41 @@ debug netns(内核栈) ── dbg0 ── socat(双 TAP 桥) ── <switch>-tN 
 
 背景与原理推导见 [debug-tap-poc_zh.md](debug-tap-poc_zh.md)（双 TAP PoC、socat
 简化、Geneve 隔离验证）。
+Python 标准库替代方案及流程图见
+[vswitch-tap-debug-python-design_zh.md](vswitch-tap-debug-python-design_zh.md)。
+Go 集成版设计及流程图见
+[vswitch-debug-design_zh.md](vswitch-debug-design_zh.md)。
+
+## Go 集成版 `vswitch debug`
+
+```bash
+# 仅有一个 switch 时自动选择；多个 switch 时从终端选择
+connector-ctl vswitch debug
+connector-ctl vswitch debug --port 4 e2br0919
+connector-ctl vswitch debug e2br0919 -- curl -sS -m5 https://<endpoint>/
+connector-ctl vswitch debug --transit-gateway-ip 10.12.0.2 \
+    --transit-geneve-vni 100 sw1 -- ping -c 3 10.1.0.2
+
+# 调整 attach 的超时（秒），并查看或恢复 Go 版会话
+connector-ctl vswitch debug --ctl-timeout 30 e2br0919
+connector-ctl vswitch debug --list
+connector-ctl vswitch debug --cleanup-stale
+```
+
+Go 版支持同名的 `DEBUG_PORT`、`DEBUG_CIDR`、`DEBUG_GATEWAY`、`DEBUG_DNS`、
+`DEBUG_TAIL_TRIES`、`DEBUG_CTL_TIMEOUT`、`DEBUG_KEEP_PROXY`、`DEBUG_STATE_ROOT`
+及 `TRANSIT_*` 环境变量；显式命令行参数优先。默认会话目录为
+`/run/connector-debug`，每个会话使用 `state.json`。Shell 版仍使用
+`/run/connector-debug-tap` 和 key=value 的 `session` 文件。两版会话互不干扰，
+也互不读取或恢复；混用时需分别执行两版的 `--cleanup-stale`。Go 版运行时
+无需 `socat`、`nsenter`、`ip` 或 `ethtool` 命令；默认交互会话仍使用宿主机的 Bash。
+
+Go 版私有 switch 的管理 VIP、端口恢复与双 switch Geneve E2E：
+
+```bash
+go build -o /tmp/connector-ctl-debug-e2e ./cmd/connector-ctl
+CONNECTOR_CTL=/tmp/connector-ctl-debug-e2e python3 test/e2e/vswitch_debug_test.py
+```
 
 ## 快速上手
 
