@@ -143,6 +143,27 @@ func TapHolders(procRoot, tapName string) ([]TapHolder, error) {
 			return nil, fmt.Errorf("%w: readdir %s: %v", ErrProcScanIncomplete, task, err)
 		}
 		for _, info := range infos {
+			// Most hosts have far more socket/pipe/regular fds than TAP fds.
+			// stat of the fd is cheaper than opening and parsing its fdinfo;
+			// only the TUN character device (10:200) can carry an iff line.
+			fdPath := filepath.Join(procRoot, task, "fd", info.Name())
+			fdStat, statErr := os.Stat(fdPath)
+			if statErr == nil {
+				if fdStat.Mode()&os.ModeCharDevice == 0 {
+					continue
+				}
+				device, ok := fdStat.Sys().(*syscall.Stat_t)
+				if !ok {
+					return nil, fmt.Errorf("%w: stat %s lacks device identity", ErrProcScanIncomplete, fdPath)
+				}
+				if unix.Major(uint64(device.Rdev)) != 10 || unix.Minor(uint64(device.Rdev)) != 200 {
+					continue
+				}
+			} else if !os.IsNotExist(statErr) {
+				return nil, fmt.Errorf("%w: stat %s: %v", ErrProcScanIncomplete, fdPath, statErr)
+			}
+			// A disappearing fd may still have fdinfo for a moment. Reading it
+			// also keeps fake proc trees used by tests conservative.
 			data, err := os.ReadFile(filepath.Join(procRoot, task, "fdinfo", info.Name()))
 			if err != nil {
 				if os.IsNotExist(err) {

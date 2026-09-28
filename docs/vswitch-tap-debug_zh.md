@@ -25,6 +25,7 @@ Go 集成版设计及流程图见
 connector-ctl vswitch debug
 connector-ctl vswitch debug --port 4 e2br0919
 connector-ctl vswitch debug e2br0919 -- curl -sS -m5 https://<endpoint>/
+connector-ctl vswitch debug --command-timeout 15 e2br0919 -- curl -sS https://<endpoint>/
 connector-ctl vswitch debug --transit-gateway-ip 10.12.0.2 \
     --transit-geneve-vni 100 sw1 -- ping -c 3 10.1.0.2
 
@@ -35,12 +36,20 @@ connector-ctl vswitch debug --cleanup-stale
 ```
 
 Go 版支持同名的 `DEBUG_PORT`、`DEBUG_CIDR`、`DEBUG_GATEWAY`、`DEBUG_DNS`、
-`DEBUG_TAIL_TRIES`、`DEBUG_CTL_TIMEOUT`、`DEBUG_KEEP_PROXY`、`DEBUG_STATE_ROOT`
+`DEBUG_TAIL_TRIES`、`DEBUG_CTL_TIMEOUT`、`DEBUG_COMMAND_TIMEOUT`、
+`DEBUG_KEEP_PROXY`、`DEBUG_STATE_ROOT`
 及 `TRANSIT_*` 环境变量；显式命令行参数优先。默认会话目录为
 `/run/connector-debug`，每个会话使用 `state.json`。Shell 版仍使用
 `/run/connector-debug-tap` 和 key=value 的 `session` 文件。两版会话互不干扰，
 也互不读取或恢复；混用时需分别执行两版的 `--cleanup-stale`。Go 版运行时
 无需 `socat`、`nsenter`、`ip` 或 `ethtool` 命令；默认交互会话仍使用宿主机的 Bash。
+一次性命令默认运行上限为 120 秒，可用 `--command-timeout` 调整；交互 Bash
+没有命令时限。Ctrl+C 或超时后会终止命令并清理资源；若内核态进程无法退出，保留端口
+和会话记录供 `--cleanup-stale` 重试。
+
+Go 版未指定 `--dns` / `DEBUG_DNS` 时使用 `169.254.169.253`。
+要复现使用了其他 DNS 的沙箱，需显式传入 `--dns`。debug netns 的
+`/etc/resolv.conf` 使用最终选定的地址。
 
 Go 版私有 switch 的管理 VIP、端口恢复与双 switch Geneve E2E：
 

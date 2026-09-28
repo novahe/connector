@@ -2,6 +2,7 @@
 """Private-switch lifecycle E2E for connector-ctl vswitch debug (Go)."""
 import json
 import os
+import signal
 from pathlib import Path
 import shutil
 import subprocess
@@ -75,9 +76,66 @@ class DebugGoE2E(unittest.TestCase):
                                           "--port", "4", switch, "--", "ping", "-c", "1",
                                           "-W", "2", "169.254.169.254", check=False)
                     self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertNotIn("debug: EOF", result.stderr)
+                    dns = self.run_cmd(CTL, "vswitch", "debug", "--state-root", state,
+                                       "--port", "4", switch, "--", "cat", "/etc/resolv.conf")
+                    self.assertEqual(dns.stdout, "nameserver 169.254.169.253\n")
+                    override = self.run_cmd(CTL, "vswitch", "debug", "--state-root", state,
+                                            "--port", "4", "--dns", "192.0.2.53", switch,
+                                            "--", "cat", "/etc/resolv.conf")
+                    self.assertEqual(override.stdout, "nameserver 192.0.2.53\n")
                     slots = self.run_cmd(CTL, "vswitch", "show", "slots", switch, "3")
                     self.assertEqual(json.loads(slots.stdout)[0]["state"], "free")
                     self.assertFalse(list(Path(state).glob("session.*")))
+                    failed_child = self.run_cmd(CTL, "vswitch", "debug", "--state-root", state,
+                                                "--port", "4", switch, "--", "sh", "-c",
+                                                "exit 37", check=False)
+                    self.assertEqual(failed_child.returncode, 37, failed_child.stderr)
+                    self.assertFalse(list(Path(state).glob("session.*")))
+                    hung = self.run_cmd(CTL, "vswitch", "debug", "--state-root", state,
+                                        "--port", "4", "--command-timeout", "1", switch,
+                                        "--", "sleep", "60", check=False)
+                    self.assertEqual(hung.returncode, 124, hung.stderr)
+                    self.assertIn("timed out after 1 seconds", hung.stderr)
+                    slots = self.run_cmd(CTL, "vswitch", "show", "slots", switch, "3")
+                    self.assertEqual(json.loads(slots.stdout)[0]["state"], "free")
+                    self.assertFalse(list(Path(state).glob("session.*")))
+                    oversized = self.run_cmd(CTL, "vswitch", "debug", "--state-root", state,
+                                             "--port", "4", "--command-timeout",
+                                             "9223372036854775807", switch, "--", "/bin/true",
+                                             check=False)
+                    self.assertNotEqual(oversized.returncode, 0)
+                    self.assertIn("too large", oversized.stderr)
+                    self.assertFalse(list(Path(state).glob("session.*")))
+                    sleeping = subprocess.Popen(
+                        [CTL, "vswitch", "debug", "--state-root", state, "--port", "4",
+                         switch, "--", "sleep", "9999"],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+                        start_new_session=True)
+                    try:
+                        deadline = time.monotonic() + 15
+                        child_pid = None
+                        while time.monotonic() < deadline:
+                            records = list(Path(state).glob("session.*/state.json"))
+                            if records and json.loads(records[0].read_text()).get("phase") == "running":
+                                child_pid = json.loads(records[0].read_text())["child_pid"]
+                                break
+                            if sleeping.poll() is not None:
+                                self.fail(f"sleep debug exited early: {sleeping.stderr.read()}")
+                            time.sleep(.1)
+                        else:
+                            self.fail("sleep debug did not reach running phase")
+                        os.killpg(sleeping.pid, signal.SIGINT)
+                        _, sleep_err = sleeping.communicate(timeout=15)
+                        self.assertEqual(sleeping.returncode, 130, sleep_err)
+                        self.assertFalse(Path(f"/proc/{child_pid}").exists(), sleep_err)
+                        slots = self.run_cmd(CTL, "vswitch", "show", "slots", switch, "3")
+                        self.assertEqual(json.loads(slots.stdout)[0]["state"], "free", sleep_err)
+                        self.assertFalse(list(Path(state).glob("session.*")), sleep_err)
+                    finally:
+                        if sleeping.poll() is None:
+                            sleeping.kill()
+                            sleeping.wait(timeout=5)
                     if before is not None:
                         after = self.run_cmd("ip", "netns", "exec", switch,
                                              "ethtool", "-k", tap).stdout

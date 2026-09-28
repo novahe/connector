@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -18,21 +17,31 @@ func runDebugCleanup(root *debug.StateRoot, dir string, stale bool) error {
 	if err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(debugCtlTimeout+60)*time.Second)
-	defer cancel()
 	args := []string{"__debug-cleanup", "--state-root", root.Path, "--dir", dir}
 	if stale {
 		args = append(args, "--stale")
 	}
-	worker := exec.CommandContext(ctx, self, args...)
+	worker := exec.Command(self, args...)
 	worker.Stderr = os.Stderr
-	if err := worker.Run(); err != nil {
-		if ctx.Err() != nil {
-			return fmt.Errorf("cleanup timed out; session retained: %w", ctx.Err())
+	if err := worker.Start(); err != nil {
+		return fmt.Errorf("start cleanup worker: %w", err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- worker.Wait() }()
+	select {
+	case err := <-done:
+		if err == nil {
+			return nil
 		}
 		return fmt.Errorf("cleanup worker: %w", err)
+	case <-time.After(time.Duration(debugCtlTimeout)*time.Second + 60*time.Second):
+		_ = worker.Process.Kill()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+		}
+		return fmt.Errorf("cleanup timed out; session retained")
 	}
-	return nil
 }
 
 var debugCleanupInternal = &cobra.Command{

@@ -7,7 +7,9 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -27,19 +29,20 @@ import (
 )
 
 var (
-	debugPort       int
-	debugList       bool
-	debugCleanup    bool
-	debugCIDR       string
-	debugGateway    string
-	debugDNS        string
-	debugTailTries  int
-	debugCtlTimeout int
-	debugKeepProxy  bool
-	debugStateRoot  string
-	debugTransitGW  string
-	debugTransitVNI uint32
-	debugTransitMAC string
+	debugPort           int
+	debugList           bool
+	debugCleanup        bool
+	debugCIDR           string
+	debugGateway        string
+	debugDNS            string
+	debugTailTries      int
+	debugCtlTimeout     int
+	debugCommandTimeout int
+	debugKeepProxy      bool
+	debugStateRoot      string
+	debugTransitGW      string
+	debugTransitVNI     uint32
+	debugTransitMAC     string
 )
 
 var debugCmd = &cobra.Command{
@@ -63,6 +66,7 @@ vswitch-tap-debug.sh sessions require that script's own --cleanup-stale.
 
 Environment defaults (explicit flags take precedence): DEBUG_PORT, DEBUG_CIDR,
 DEBUG_GATEWAY, DEBUG_DNS, DEBUG_TAIL_TRIES, DEBUG_CTL_TIMEOUT,
+DEBUG_COMMAND_TIMEOUT,
 DEBUG_KEEP_PROXY, DEBUG_STATE_ROOT, TRANSIT_GATEWAY_IP,
 TRANSIT_GENEVE_VNI, and TRANSIT_MAC_ADDR.`,
 	Example: `  connector-ctl vswitch debug
@@ -81,9 +85,10 @@ func init() {
 	debugCmd.Flags().BoolVar(&debugCleanup, "cleanup-stale", false, "Clean sessions whose owner exited")
 	debugCmd.Flags().StringVar(&debugCIDR, "cidr", "169.254.0.21/30", "Debug TAP IPv4/CIDR (e2b profile default)")
 	debugCmd.Flags().StringVar(&debugGateway, "gateway", "169.254.0.22", "Default gateway inside the debug netns")
-	debugCmd.Flags().StringVar(&debugDNS, "dns", "169.254.169.253", "Nameserver inside the debug netns (guest-identical DNS path)")
+	debugCmd.Flags().StringVar(&debugDNS, "dns", "169.254.169.253", "Nameserver inside the debug netns (default: 169.254.169.253)")
 	debugCmd.Flags().IntVar(&debugTailTries, "tail-tries", 8, "Auto mode: try at most this many highest-numbered free TAP slots in the upper half of the pool")
 	debugCmd.Flags().IntVar(&debugCtlTimeout, "ctl-timeout", 30, "Maximum seconds for an attach operation (cleanup also bounds its worker)")
+	debugCmd.Flags().IntVar(&debugCommandTimeout, "command-timeout", 120, "Maximum seconds for a one-shot command; 0 disables the limit (interactive shell is unlimited)")
 	debugCmd.Flags().BoolVar(&debugKeepProxy, "keep-proxy", false, "Keep host proxy variables inside the namespace")
 	debugCmd.Flags().StringVar(&debugStateRoot, "state-root", debug.DefaultStateRoot, "Session state directory")
 	debugCmd.Flags().StringVar(&debugTransitGW, "transit-gateway-ip", "", "Geneve transit gateway IP (when transit is configured)")
@@ -104,6 +109,9 @@ func debugDie(sess *debug.Session, root *debug.StateRoot, format string, args ..
 }
 
 func runDebug(cmd *cobra.Command, args []string) error {
+	sigCh := make(chan os.Signal, 8)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	defer signal.Stop(sigCh)
 	if err := applyDebugEnv(cmd); err != nil {
 		return err
 	}
@@ -169,8 +177,12 @@ func runDebug(cmd *cobra.Command, args []string) error {
 		switchName = args[0]
 		userCmd = args[1:]
 	}
-	if debugPort < 0 || debugTailTries < 1 || debugCtlTimeout < 1 {
-		return fmt.Errorf("--port must be nonnegative; --tail-tries and --ctl-timeout must be positive")
+	if debugPort < 0 || debugCommandTimeout < 0 || debugTailTries < 1 || debugCtlTimeout < 1 {
+		return fmt.Errorf("--port and --command-timeout must be nonnegative; --tail-tries and --ctl-timeout must be positive")
+	}
+	const maxDurationSeconds = uint64((1<<63 - 1) / int64(time.Second))
+	if uint64(debugCommandTimeout) > maxDurationSeconds || uint64(debugCtlTimeout) > maxDurationSeconds-60 {
+		return fmt.Errorf("--command-timeout or --ctl-timeout is too large")
 	}
 	// pflag strips the "--" separator, so everything after the switch name is
 	// the user command.
@@ -181,6 +193,9 @@ func runDebug(cmd *cobra.Command, args []string) error {
 	}
 	if net.ParseIP(debugGateway) == nil || net.ParseIP(debugDNS) == nil {
 		return fmt.Errorf("invalid --gateway/--dns")
+	}
+	if sig := debugPendingSignal(sigCh); sig != nil {
+		return fmt.Errorf("debug interrupted by %s", sig)
 	}
 
 	sw, err := debug.OpenSwitch(switchName)
@@ -225,6 +240,9 @@ func runDebug(cmd *cobra.Command, args []string) error {
 	var out *vswitch.AttachOutput
 	var st *debug.SessionState
 	for _, port := range candidates {
+		if sig := debugPendingSignal(sigCh); sig != nil {
+			return debugDie(sess, root, "interrupted by %s", sig)
+		}
 		st, err = sess.Load()
 		if err != nil {
 			return debugDie(sess, root, "load session before attach: %v", err)
@@ -233,7 +251,7 @@ func runDebug(cmd *cobra.Command, args []string) error {
 		if err := sess.Save(st); err != nil {
 			return debugDie(sess, root, "save pending port: %v", err)
 		}
-		attachOut, rc, err := debugAttachWorker(sess, switchName, port, innerIP.String())
+		attachOut, rc, err := debugAttachWorker(sess, switchName, port, innerIP.String(), sigCh)
 		if err != nil {
 			return debugDie(sess, root, "%v", err)
 		}
@@ -280,6 +298,9 @@ func runDebug(cmd *cobra.Command, args []string) error {
 	}
 	if idle, err := debug.TapIdle("/proc", out.PortDev); err != nil || !idle {
 		return debugDie(sess, root, "allocated TAP %s is not idle", out.PortDev)
+	}
+	if sig := debugPendingSignal(sigCh); sig != nil {
+		return debugDie(sess, root, "interrupted by %s", sig)
 	}
 
 	// ── offload snapshot + suppress, ns create, DNS ────────────────────────
@@ -389,75 +410,102 @@ func runDebug(cmd *cobra.Command, args []string) error {
 	bridge.Start()
 
 	childEnv := debugChildEnv(switchName, int(out.Port))
+	oneShot := len(userCmd) != 0
 	if len(userCmd) == 0 {
 		userCmd = []string{"bash", "--noprofile", "--norc"}
 	}
 	self, err := os.Executable()
 	if err != nil {
-		bridge.Stop()
+		_ = stopDebugBridge(bridge, 2*time.Second)
 		return debugDie(sess, root, "resolve self: %v", err)
 	}
 	execArgs := append([]string{"__debug-exec", "--netns", debugNS, "--"}, userCmd...)
 	child := exec.Command(self, execArgs...)
 	child.Env = childEnv
 	child.Stdin, child.Stdout, child.Stderr = os.Stdin, os.Stdout, os.Stderr
+	if sig := debugPendingSignal(sigCh); sig != nil {
+		_ = stopDebugBridge(bridge, 2*time.Second)
+		return debugDie(sess, root, "interrupted by %s", sig)
+	}
 	if err := child.Start(); err != nil {
-		bridge.Stop()
+		_ = stopDebugBridge(bridge, 2*time.Second)
 		return debugDie(sess, root, "start command: %v", err)
 	}
 	st, err = sess.Load()
 	if err != nil {
-		_ = bridge.Stop()
+		_ = stopDebugBridge(bridge, 2*time.Second)
 		return debugDie(sess, root, "load command session: %v", err)
 	}
 	st.ChildPID = child.Process.Pid
 	st.ChildStart, err = debug.ProcStarttimeOf(child.Process.Pid)
 	if err != nil {
-		_ = bridge.Stop()
+		_ = stopDebugBridge(bridge, 2*time.Second)
 		return debugDie(sess, root, "identify command process: %v", err)
 	}
 	st.Phase = "running"
 	if err := sess.Save(st); err != nil {
-		bridge.Stop()
+		_ = stopDebugBridge(bridge, 2*time.Second)
 		return debugDie(sess, root, "save session: %v", err)
 	}
 
 	fmt.Fprintf(os.Stderr, "debug: port=%d TAP=%s MAC=%s netns=%s\n", out.Port, out.PortDev, out.PortMAC, debugNS)
 	fmt.Fprintf(os.Stderr, "debug: entered %s; exit to release port %d\n", debugNS, out.Port)
 
-	sigCh := make(chan os.Signal, 4)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 	waitErr := make(chan error, 1)
 	go func() { waitErr <- child.Wait() }()
+	var commandTimeout <-chan time.Time
+	if oneShot && debugCommandTimeout > 0 {
+		timer := time.NewTimer(time.Duration(debugCommandTimeout) * time.Second)
+		defer timer.Stop()
+		commandTimeout = timer.C
+	}
 
 	var runErr error
+	var interruptedBy syscall.Signal
+	timedOut := false
 loop:
 	for {
 		select {
 		case sig := <-sigCh:
-			_ = debug.SignalProcess("/proc", child.Process.Pid, st.ChildStart, sig.(syscall.Signal))
-			go func() {
-				time.Sleep(1500 * time.Millisecond)
-				_ = debug.SignalProcess("/proc", child.Process.Pid, st.ChildStart, syscall.SIGKILL)
-			}()
+			childErr, stopErr := stopDebugCommand(child.Process.Pid, st.ChildStart, waitErr)
+			interruptedBy = sig.(syscall.Signal)
+			runErr = fmt.Errorf("debug command interrupted by %s", sig)
+			if childErr != nil {
+				runErr = fmt.Errorf("%w: %w", runErr, childErr)
+			}
+			if stopErr != nil {
+				runErr = fmt.Errorf("%w; %v", runErr, stopErr)
+			}
+			break loop
 		case err := <-waitErr:
 			runErr = err
 			break loop
+		case <-commandTimeout:
+			childErr, stopErr := stopDebugCommand(child.Process.Pid, st.ChildStart, waitErr)
+			timedOut = true
+			runErr = fmt.Errorf("debug command timed out after %d seconds", debugCommandTimeout)
+			if childErr != nil {
+				runErr = fmt.Errorf("%w: %w", runErr, childErr)
+			}
+			if stopErr != nil {
+				runErr = fmt.Errorf("%w; %v", runErr, stopErr)
+			}
+			break loop
 		case <-bridge.Done():
 			// relay fault: terminate the command, never leave a live-but-dead shell
-			_ = debug.SignalProcess("/proc", child.Process.Pid, st.ChildStart, syscall.SIGTERM)
-			time.Sleep(300 * time.Millisecond)
-			_ = debug.SignalProcess("/proc", child.Process.Pid, st.ChildStart, syscall.SIGKILL)
-			<-waitErr
+			_, stopErr := stopDebugCommand(child.Process.Pid, st.ChildStart, waitErr)
 			runErr = fmt.Errorf("debug relay failed")
+			if stopErr != nil {
+				runErr = fmt.Errorf("%w; %v", runErr, stopErr)
+			}
 			break loop
 		}
 	}
-	signal.Stop(sigCh)
-
-	// Close both relay fds BEFORE cleanup: the recovery pipeline must see the
-	// pool TAP as fd-idle, otherwise it treats our own holder as foreign.
-	_ = bridge.Stop()
+	// Attempt to close both relay fds before cleanup. If closure stalls, the
+	// recovery pipeline sees the live holder and conservatively retains the port.
+	if err := stopDebugBridge(bridge, 2*time.Second); err != nil && !errors.Is(err, io.EOF) {
+		fmt.Fprintf(os.Stderr, "debug: %v\n", err)
+	}
 
 	cleanupErr := runDebugCleanup(root, sess.Dir, false)
 	if cleanupErr != nil {
@@ -466,11 +514,20 @@ loop:
 		return cleanupErr
 	}
 	if runErr != nil {
-		if ee, ok := runErr.(*exec.ExitError); ok {
-			os.Exit(ee.ExitCode())
+		if interruptedBy != 0 {
+			fmt.Fprintln(os.Stderr, runErr)
+			os.Exit(128 + int(interruptedBy))
 		}
-		if !strings.Contains(runErr.Error(), "relay failed") {
-			return runErr
+		if timedOut {
+			fmt.Fprintln(os.Stderr, runErr)
+			os.Exit(124)
+		}
+		var ee *exec.ExitError
+		if errors.As(runErr, &ee) {
+			if status, ok := ee.Sys().(syscall.WaitStatus); ok && status.Signaled() {
+				os.Exit(128 + int(status.Signal()))
+			}
+			os.Exit(ee.ExitCode())
 		}
 		return runErr
 	}
@@ -484,6 +541,7 @@ func applyDebugEnv(cmd *cobra.Command) error {
 		{"gateway", "DEBUG_GATEWAY"}, {"dns", "DEBUG_DNS"},
 		{"tail-tries", "DEBUG_TAIL_TRIES"}, {"state-root", "DEBUG_STATE_ROOT"},
 		{"ctl-timeout", "DEBUG_CTL_TIMEOUT"},
+		{"command-timeout", "DEBUG_COMMAND_TIMEOUT"},
 		{"transit-gateway-ip", "TRANSIT_GATEWAY_IP"},
 		{"transit-geneve-vni", "TRANSIT_GENEVE_VNI"},
 		{"transit-mac-addr", "TRANSIT_MAC_ADDR"},
@@ -574,7 +632,7 @@ const debugAttachBusy = 99 // worker-detected "port already allocated"
 
 // debugAttachWorker runs attach in a reexec'd worker holding attach.lock,
 // so a SIGKILLed parent cannot race recovery against a live attach.
-func debugAttachWorker(sess *debug.Session, switchName string, port uint32, innerIP string) (*vswitch.AttachOutput, int, error) {
+func debugAttachWorker(sess *debug.Session, switchName string, port uint32, innerIP string, interrupt <-chan os.Signal) (*vswitch.AttachOutput, int, error) {
 	lockFD, err := os.OpenFile(sess.AttachLockPath(), os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
 		return nil, 0, fmt.Errorf("attach lock: %w", err)
@@ -582,6 +640,9 @@ func debugAttachWorker(sess *debug.Session, switchName string, port uint32, inne
 	defer lockFD.Close()
 	deadline := time.Now().Add(time.Duration(debugCtlTimeout) * time.Second)
 	for {
+		if sig := debugPendingSignal(interrupt); sig != nil {
+			return nil, 0, fmt.Errorf("attach interrupted by %s", sig)
+		}
 		err = unix.Flock(int(lockFD.Fd()), unix.LOCK_EX|unix.LOCK_NB)
 		if err == nil {
 			break
@@ -593,6 +654,9 @@ func debugAttachWorker(sess *debug.Session, switchName string, port uint32, inne
 			return nil, 0, fmt.Errorf("attach lock timed out after %d seconds", debugCtlTimeout)
 		}
 		time.Sleep(50 * time.Millisecond)
+	}
+	if sig := debugPendingSignal(interrupt); sig != nil {
+		return nil, 0, fmt.Errorf("attach interrupted by %s", sig)
 	}
 	if err := os.Remove(sess.AttachRCPath()); err != nil && !os.IsNotExist(err) {
 		return nil, 0, fmt.Errorf("remove old attach receipt: %w", err)
@@ -628,9 +692,20 @@ func debugAttachWorker(sess *debug.Session, switchName string, port uint32, inne
 	go func() { done <- worker.Wait() }()
 	select {
 	case <-done:
+	case sig := <-interrupt:
+		_ = worker.Process.Kill()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+		}
+		return nil, 0, fmt.Errorf("attach interrupted by %s; session retained until cleanup verifies allocation", sig)
 	case <-time.After(time.Duration(debugCtlTimeout) * time.Second):
 		_ = worker.Process.Kill()
-		<-done
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			return nil, 0, fmt.Errorf("attach worker did not exit after KILL; session retained")
+		}
 		if _, err := os.Stat(sess.AttachRCPath()); err != nil {
 			return nil, 0, fmt.Errorf("attach worker killed on timeout with no receipt; session retained")
 		}
